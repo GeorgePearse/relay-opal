@@ -44,8 +44,10 @@ def heavy_tailed(rows, cols, alpha, seed):
 
 def analyze(model):
     details = ww.WeightWatcher(model=model).analyze(randomize=False, mp_fit=False, plot=False, savefig=False)
-    frame = pl.from_pandas(details[["longname", *WW_COLUMNS]]).rename(WW_COLUMNS)
-    return frame.rename({"longname": "name"})
+    frame = pl.DataFrame({"name": details["longname"].astype(str).tolist()})
+    return frame.with_columns(
+        [pl.Series(ours, details[theirs].astype(float).tolist()) for theirs, ours in WW_COLUMNS.items()]
+    )
 
 
 def compare(ours, theirs):

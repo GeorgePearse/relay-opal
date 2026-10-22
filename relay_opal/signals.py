@@ -220,17 +220,18 @@ def scan(
 
 def scan_delta(prev, cur):
     """Per-layer changes between two scans joined on (name, head): each delta metric as `<metric>_delta`, with the
-    current value, and `<metric>_delta_z`, the delta's z-score across layers (outliers between layers, as the
-    short-run reading of WeightWatcher asks for), heads excluded from the z-score."""
+    current value, and `<metric>_delta_z`, the delta's z-score across layers (the outliers between layers that the
+    short-run reading of WeightWatcher asks for; 0 when the deltas' spread is below 1e-6), heads excluded from the
+    z-score."""
     cols = ["name", "head", "kind", *DELTA_METRICS]
     p = prev.select(cols).rename({m: f"{m}_prev" for m in DELTA_METRICS})
-    d = cur.select(cols).join(p, on=["name", "head", "kind"], how="inner")
+    d = cur.select(cols).join(p, on=["name", "head", "kind"], how="inner", nulls_equal=True)
     d = d.with_columns([(pl.col(m) - pl.col(f"{m}_prev")).alias(f"{m}_delta") for m in DELTA_METRICS])
     layer = pl.col("head").is_null()
     for m in DELTA_METRICS:
         col = pl.col(f"{m}_delta")
         mean, std = col.filter(layer).mean(), col.filter(layer).std()
-        d = d.with_columns(pl.when(std > 0).then((col - mean) / std).otherwise(0.0).alias(f"{m}_delta_z"))
+        d = d.with_columns(pl.when(std > 1e-6).then((col - mean) / std).otherwise(0.0).alias(f"{m}_delta_z"))
     return d.drop([f"{m}_prev" for m in DELTA_METRICS])
 
 

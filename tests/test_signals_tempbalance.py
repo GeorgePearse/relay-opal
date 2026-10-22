@@ -4,6 +4,7 @@ preserved, the first and last layers keep the base rate as in the reference code
 the paper's equation (2)."""
 
 import json
+import math
 from pathlib import Path
 
 import polars as pl
@@ -11,7 +12,7 @@ import pytest
 import torch
 from torch import nn
 
-from relay_opal.signals import TempBalance, scan
+from relay_opal.signals import TempBalance, scan, scan_delta
 
 FIXTURE = Path(__file__).parent / "fixtures" / "signals_tempbalance.json"
 LAYERS = {
@@ -94,3 +95,17 @@ def test_groups_from_covers_every_parameter_and_scan_rows_feed_step():
     tb = TempBalance(opt, model, BASE)
     out = tb.step(scan(model, exclude_output_heads=False, device_svd=False))
     assert out.height == len(LAYERS) and out["lr"].is_finite().all()
+
+
+def test_scan_delta_keeps_layer_rows_and_heads():
+    model = resnet_like()
+    torch.manual_seed(0)
+    prev = scan(model, exclude_output_heads=False, device_svd=False)
+    with torch.no_grad():
+        model[0].weight.mul_(2.0)
+    cur = scan(model, exclude_output_heads=False, device_svd=False)
+    d = scan_delta(prev, cur)
+    assert d.height == cur.height and d.filter(pl.col("head").is_null()).height == cur.height
+    assert abs(d.filter(pl.col("name") == "conv1")["alpha_delta"][0]) < 1e-9
+    assert d.filter(pl.col("name") == "conv1")["log_spectral_norm_delta"][0] == pytest.approx(math.log10(4.0))
+    assert (d["alpha_delta_z"].abs() < 1e-9).all()
