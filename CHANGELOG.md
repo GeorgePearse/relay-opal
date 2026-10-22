@@ -11,7 +11,9 @@
   fallback; every check reports NaN and inf counts, weight-norm drift and seconds per site type; checkpoints back a
   `request_restore(update)` tool and the restart after a crash (crash text handed to the agent as a note).
 - `examples/track1`: the Noise Track 1 reproduction with four arms (backprop, relay, relay-opal, relay-opal-ptx), a
-  Modal launcher for one H100 with an ssh tunnel for the mailbox broker, and the one-seed results.
+  Modal launcher for one H100 with an ssh tunnel for the mailbox broker, and the one-seed results: backprop 3.7079,
+  relay 3.7036, relay-opal 3.7051, relay-opal-ptx 3.7050, with the PTX arm's path ledger (7 programs, all Python,
+  0 PTX written, 0 failures, 0 corruptions).
 - `relay_opal.wrap(optimizer, model, estimator, goal=..., total_steps=..., fidelity_every=..., **opal_kwargs)`: the
   hybrid. OPAL versions, swaps and reverts the modules its updater imports, so the agent gets a third program,
   `estimator.py`, whose `settings(update, total_updates)` the loop reads before every estimate; the fidelity report
