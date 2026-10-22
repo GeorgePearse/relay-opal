@@ -64,13 +64,39 @@ settings that fail validation or whose estimate raises to the last settings that
 agent at its next decision. The prompt the agent sees is OPAL's neutral prompt plus an estimator section
 (`relay_opal/opal/prompt.md`).
 
+## PTX mode: the agent writes kernels, nothing stops it
+
+`relay_opal.wrap(..., mode="ptx", checkpoint_every=50)` starts the agent from programs that already carry PTX: an
+AdamW step kernel in `updater.py` and Relay's hidden-unit step in `estimator.py` (`relay_opal.ptx_seeds`, both
+bit-identical to their eager twins), loaded through `relay_opal.ptx.PtxModule`, a ctypes loader on the CUDA driver
+API that returns the ptxas text when assembly fails. `estimator.py` may define `KERNELS`, replacements for any step
+of `relay_opal.relay.kernels`. There is no parity check, sandbox or fallback between a kernel the agent writes and
+the parameters it runs on: a wrong index corrupts the weights, an illegal address kills the process. Consequences are
+reported, not prevented: every check shows the agent NaN and inf counts in parameters, gradients and optimizer state,
+the weight-norm drift, seconds per site type, the per-site cosine to autograd, and the exact ptxas or driver text of
+a failed load; the loop checkpoints every N updates, the agent can call `relay_opal.ptx.request_restore(update)` from
+its programs, and a dead process is restarted from the last checkpoint with the previous program and the crash text
+in the agent's next message. The fourth Track 1 arm runs this.
+
 ## Results
 
-Noise Track 1 on one H100 (Modal), one seed, see `examples/README.md` for the commands, hardware, time and cost.
+Noise Track 1, the whole epoch (610 updates of 8 sequences), one GPU on Modal, seed 0, one run per arm. The
+commands, hardware, time and cost per arm are in `examples/README.md`.
 
-RESULTS_TABLE
+| arm | val loss | seconds per update | train time | fidelity (block matrices) | agent |
+|---|---|---|---|---|---|
+| backprop, same optimizer | 3.7079 | 0.058 | 35 s | 1 | none |
+| relay (OPAL `keep`) | 3.7036 | 1.54 | 954 s | 0.980 at init, 0.998 from update 50 | none |
+| relay + opal (Python programs) | 3.7051 | 1.70 between decisions, 2.75 with the waits | 1677 s | 0.999 / 0.998 | 12 decisions, 6 applied, USD 2.64 |
+| relay + opal + ptx | PTX_ROW |
 
-These are single-seed numbers from short runs; the Relay PR's own numbers (8xH100, five seeds) are the reference.
+The Relay PR reports 3.7044 for its logged seed-0 run and 3.7081 for backprop on 8xH100; one GPU reproduces both to
+the third decimal. The agent of the Python arm read the fidelity values, judged the estimator sound ("a fidelity
+check below 0.95, or a loss spike, would make me revisit the estimator") and never edited `estimator.py`: its six
+applied changes rewrote the analysis, took over the learning-rate schedule unchanged, halved and then cut to 0.3x the
+rate of the 16 mixing scalars, and started the warmdown earlier. These are single-seed numbers; the Relay PR's own
+spread (3.7107 ± 0.0056 over five seeds for Relay, 3.7122 ± 0.0089 over three for backprop) is larger than the gaps
+between the arms.
 
 ## Limits
 
