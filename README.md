@@ -114,6 +114,9 @@ between the arms.
 
 ## Inspiration
 
+The full inspiration document, with the training-dynamics tables, is [docs/inspiration.md](docs/inspiration.md).
+In one line each:
+
 - [Dust](https://github.com/qlabs-eng/dust) (Q Labs): the fixed model, data and score of the speedrun; the
   population-based estimator that Boost, Cut and Relay replaced.
 - [Noise](https://github.com/qlabs-eng/noise): the speedrun for pretraining without backpropagation, its rules and
