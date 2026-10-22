@@ -1,0 +1,13 @@
+[workspace]
+members = ["rust/signals", "rust/signals-py"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/GeorgePearse/relay-opal"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

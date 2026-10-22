@@ -6,6 +6,18 @@ on:
   pull_request:
 
 jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test -p relay_opal_signals
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -13,12 +25,15 @@ jobs:
         python: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v6
         with:
           version: "0.9.5"
       - run: uv venv --python ${{ matrix.python }}
       - run: uv pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu
-      - run: uv pip install -e ".[dev]"
+      - run: uv pip install maturin
+      - run: uv run maturin develop --release --extras dev
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pytest
