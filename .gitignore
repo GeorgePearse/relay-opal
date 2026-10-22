@@ -14,3 +14,7 @@ examples/track1/logs/
 noise.deleted-*
 rel.deleted-*
 venv.deleted-*
+
+# Rust
+target/
+*.so

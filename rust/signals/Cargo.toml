@@ -1,0 +1,15 @@
+[package]
+name = "relay_opal_signals"
+description = "Per-layer training signals: weight spectra (WeightWatcher), TempBalance learning rates, Cockpit-style instruments and PyHessian-style Krylov drivers, tensor-agnostic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
+rand = { version = "0.10", default-features = false, features = ["std", "std_rng"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
