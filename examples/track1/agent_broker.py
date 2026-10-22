@@ -11,6 +11,7 @@ import argparse
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -35,7 +36,7 @@ def main():
         f'exec /usr/bin/ssh -p {args.port}{key} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$@"\n'
     )
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
-    env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}")
+    env = dict(os.environ, PATH=f"{bindir}:{Path(sys.executable).parent}:{os.environ['PATH']}")
     cmd = ["opal", "broker", args.box, "--ssh", f"{args.user}@{args.host}", "--backend", args.backend]
     if args.backend != "keep":
         cmd += ["--model", args.model, "--effort", args.effort]

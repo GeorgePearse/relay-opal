@@ -1,12 +1,14 @@
-"""Noise Track 1 (the 37.7M-parameter GPT, one epoch of 4,880 sequences) with one of three arms on one GPU:
+"""Noise Track 1 (the 37.7M-parameter GPT, one epoch of 4,880 sequences) with one of four arms on one GPU:
 
-    python train.py --arm backprop     # autograd, the record's optimizer (ANVIL II on block matrices, Adam elsewhere)
-    python train.py --arm relay        # Relay fills the gradients, OPAL wraps the optimizer with backend="keep"
-    python train.py --arm relay-opal --max-cost-usd 15 [--backend claude | --backend mailbox:<folder>]
+    python train.py --arm backprop       # autograd, the record's optimizer (ANVIL II on block matrices, Adam elsewhere)
+    python train.py --arm relay          # Relay fills the gradients, OPAL wraps the optimizer with backend="keep"
+    python train.py --arm relay-opal     --max-cost-usd 15 [--backend claude | --backend mailbox:<folder>]
+    python train.py --arm relay-opal-ptx --max-cost-usd 25 --checkpoint-every 50   # the agent writes PTX, unprotected
 
 The model, init, optimizer, rates, warmdown schedule, batch (8 sequences per update) and data order are the Relay
 script's; the fixed step count (--steps) scales the schedule down for a short run. Writes config.json, metrics.jsonl,
-result.json and final.pt (loadable by qlabs-eng/noise utils/eval.py) to --output.
+result.json and final.pt (loadable by qlabs-eng/noise utils/eval.py) to --output. --resume continues a run from
+--output/checkpoints/latest.pt (the PTX arm after a crash: crash.txt in --output is handed to the agent).
 """
 
 import argparse
@@ -30,6 +32,7 @@ GOAL = (
     "The 37.7M-parameter GPT of the Noise speedrun on 10M FineWeb tokens, one epoch, gradients estimated forward-only "
     "by Relay; judged by the mean next-token cross-entropy on the fixed validation set after the last update."
 )
+AGENT_ARMS = ("relay-opal", "relay-opal-ptx")
 
 
 @torch.no_grad()
@@ -50,11 +53,25 @@ def schedulers(opts, steps):
     return [torch.optim.lr_scheduler.LambdaLR(o, rate) for o in opts]
 
 
+def program_ledger(run_dir):
+    """Every program version the agent wrote, with its language, from OPAL's run folder."""
+    out = []
+    for folder in sorted((Path(run_dir) / "programs").glob("v*")):
+        files = {p.name: p.read_text(errors="replace") for p in folder.glob("*.py")}
+        language = "ptx" if any(".entry" in t and ".target" in t for t in files.values()) else "python"
+        if any("triton" in t for t in files.values()):
+            language = "triton"
+        out.append(
+            dict(version=folder.name, files=sorted(files), language=language, bytes=sum(map(len, files.values())))
+        )
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output", type=Path, default=Path("logs/relay"))
-    parser.add_argument("--arm", choices=("backprop", "relay", "relay-opal"), default="relay")
+    parser.add_argument("--arm", choices=("backprop", "relay", *AGENT_ARMS), default="relay")
     parser.add_argument("--steps", type=int, default=0, help="Updates to run (0: the whole epoch, 610).")
     parser.add_argument("--batch", type=int, default=8, help="Sequences per update.")
     parser.add_argument("--micro", type=int, default=1, help="Sequences per Relay estimate call.")
@@ -62,17 +79,20 @@ def main():
     parser.add_argument("--routes", type=int, default=0, help="MLP units per token carrying a move (0: H/4).")
     parser.add_argument("--fidelity-every", type=int, default=0)
     parser.add_argument("--eval-every", type=int, default=0, help="Untimed validation every this many updates.")
-    parser.add_argument("--backend", default="claude", help="relay-opal: claude, codex or mailbox:<folder>.")
+    parser.add_argument("--backend", default="claude", help="agent arms: claude, codex, keep or mailbox:<folder>.")
     parser.add_argument("--max-cost-usd", type=float, default=None)
     parser.add_argument("--decisions", type=int, default=None)
     parser.add_argument("--every", type=int, default=10)
     parser.add_argument("--blocking", default="True")
+    parser.add_argument("--checkpoint-every", type=int, default=0)
+    parser.add_argument("--resume", action="store_true", help="Continue from --output/checkpoints/latest.pt.")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--preset", choices=("38m", "tiny"), default="38m", help="tiny: a 2-block width-64 smoke test.")
     parser.add_argument("--synthetic", type=int, default=0, help="Smoke test: this many random rows instead of data.")
     args = parser.parse_args()
-    if args.arm == "relay-opal" and args.max_cost_usd is None:
-        raise SystemExit("--max-cost-usd is required for the agent arm")
+    if args.arm in AGENT_ARMS and args.max_cost_usd is None:
+        raise SystemExit("--max-cost-usd is required for the agent arms")
+    ptx = args.arm == "relay-opal-ptx"
 
     device = torch.device(args.device)
     cuda = device.type == "cuda"
@@ -90,30 +110,35 @@ def main():
     training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
     steps = args.steps or len(training) // args.batch
     sync = torch.cuda.synchronize if cuda else (lambda: None)
-    if args.output.exists() and any(args.output.iterdir()):
+    checkpoints = args.output / "checkpoints"
+    if args.resume and not (checkpoints / "latest.pt").exists():
+        raise FileNotFoundError(f"--resume: no checkpoint in {checkpoints}")
+    if not args.resume and args.output.exists() and any(args.output.iterdir()):
         raise FileExistsError(f"Choose an empty output directory: {args.output}")
     args.output.mkdir(parents=True, exist_ok=True)
     settings = relay_opal.RelaySettings(routes=args.routes or config.n_embd)  # H/4 of the MLP width, as submitted
-    (args.output / "config.json").write_text(
-        json.dumps(
-            dict(
-                arm=args.arm,
-                steps=steps,
-                batch=args.batch,
-                micro=args.micro,
-                seed=args.seed,
-                model=asdict(config),
-                estimator=settings.to_dict() if args.arm != "backprop" else None,
-                fidelity_every=args.fidelity_every,
-                backend=args.backend if args.arm == "relay-opal" else "keep" if args.arm == "relay" else None,
-                max_cost_usd=args.max_cost_usd,
-                torch=torch.__version__,
-                gpu=torch.cuda.get_device_name(0) if cuda else str(device),
-            ),
-            indent=2,
+    if not args.resume:
+        (args.output / "config.json").write_text(
+            json.dumps(
+                dict(
+                    arm=args.arm,
+                    steps=steps,
+                    batch=args.batch,
+                    micro=args.micro,
+                    seed=args.seed,
+                    model=asdict(config),
+                    estimator=settings.to_dict() if args.arm != "backprop" else None,
+                    fidelity_every=args.fidelity_every,
+                    backend=args.backend if args.arm in AGENT_ARMS else "keep" if args.arm == "relay" else None,
+                    max_cost_usd=args.max_cost_usd,
+                    checkpoint_every=args.checkpoint_every,
+                    torch=torch.__version__,
+                    gpu=torch.cuda.get_device_name(0) if cuda else str(device),
+                ),
+                indent=2,
+            )
+            + "\n"
         )
-        + "\n"
-    )
 
     def build(fresh_seed):
         model = make_model(device, fresh_seed, config)
@@ -145,6 +170,9 @@ def main():
             run_dir=args.output / "opal",
             task_facts=f"One epoch of {len(training):,} sequences of 2,048 tokens, {args.batch} per update, one GPU.",
             summarize=False,
+            mode="ptx" if ptx else "python",
+            checkpoint_every=args.checkpoint_every,
+            checkpoint_dir=checkpoints if args.checkpoint_every else None,
             **kw,
         )
         return model, opts, scheds, loop
@@ -169,7 +197,7 @@ def main():
     noise = torch.randint(0, config.vocab_size, (args.batch, SEQ), generator=torch.Generator().manual_seed(SEED)).to(
         device
     )
-    if args.arm != "relay-opal":
+    if args.arm not in AGENT_ARMS:
         model, opts, scheds, loop = build(args.seed)
         update(model, opts, scheds, loop, noise[:, :-1].contiguous(), noise[:, 1:].contiguous())
         if loop is not None:
@@ -179,11 +207,33 @@ def main():
             torch.cuda.empty_cache()
     model, opts, scheds, loop = build(args.seed)
 
+    first, elapsed = 1, 0.0
+    if args.resume:
+        state = torch.load(checkpoints / "latest.pt", map_location="cpu", weights_only=False)
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                p.copy_(state["params"][n].to(p.device))
+        loop.load_state_dict(state["opt"])
+        first = int(state["update"]) + 1
+        records = [
+            json.loads(line) for line in (args.output / "metrics.jsonl").read_text().splitlines() if line.strip()
+        ]
+        kept = [r for r in records if r["step"] < first]
+        elapsed = kept[-1]["train_seconds"] if kept else 0.0
+        (args.output / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in kept))
+        crash = args.output / "crash.txt"
+        if crash.exists():
+            loop.say(
+                f"The training process died after update {first - 1} and was restarted from the checkpoint of that "
+                f"update with your previous program installed. The crash text:\n{crash.read_text()[-3000:]}"
+            )
+            crash.rename(args.output / f"crash_{first - 1}_{int(time.time())}.txt")
+        print(json.dumps(dict(resumed_at=first, train_seconds=elapsed)), flush=True)
+
     log = (args.output / "metrics.jsonl").open("a")
     sync()
-    start, paused = time.perf_counter(), 0.0
-    elapsed = 0.0
-    for step in range(1, steps + 1):
+    start, paused = time.perf_counter() - elapsed, 0.0
+    for step in range(first, steps + 1):
         batch = training[(step - 1) * args.batch : step * args.batch].to(device)
         loss = update(model, opts, scheds, loop, batch[:, :-1].contiguous(), batch[:, 1:].contiguous())
         sync()
@@ -212,10 +262,14 @@ def main():
         result["fidelity"] = [dict(update=f["update"], cosine=f["cosine"], seconds=f["seconds"]) for f in loop.fidelity]
         result["estimator_history"] = loop.history
         result["opal_run"] = str(loop.opt.run.dir)
+        result["programs"] = program_ledger(loop.opt.run.dir)
         loop.close()
     torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, args.output / "final.pt")
     (args.output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps({k: v for k, v in result.items() if k not in ("fidelity", "estimator_history")}), flush=True)
+    print(
+        json.dumps({k: v for k, v in result.items() if k not in ("fidelity", "estimator_history", "programs")}),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

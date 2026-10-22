@@ -152,10 +152,10 @@ def test_failing_estimate_reverts_to_fallback(tmp_path, monkeypatch):
 
     original = RelayEstimator.configure
 
-    def configure(self, settings):
+    def configure(self, settings, kernels=None):
         if settings.routes == 32:
             raise RuntimeError("pretend out of memory")
-        return original(self, settings)
+        return original(self, settings, kernels)
 
     monkeypatch.setattr(RelayEstimator, "configure", configure)
     loop, seen, notes = run_with_agent(tmp_path, agent)
