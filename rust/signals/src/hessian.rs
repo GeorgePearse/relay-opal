@@ -99,7 +99,9 @@ pub fn top_eigenvalues(
 }
 
 /// Hutchinson's trace estimate with Rademacher probes, PyHessian's `trace(maxIter, tol)`: stops when the running
-/// mean changes by less than `tol` relative. Returns every probe's `v . H v`; the estimate is their mean.
+/// mean changes by less than `tol` relative. Returns every probe's `v . H v`; the estimate is their mean. One
+/// deliberate difference: PyHessian divides the change by the signed running mean, so a negative first probe makes
+/// the ratio negative and stops it after two probes; this divides by its absolute value. `tol = 0` runs every probe.
 pub fn trace(hvp: &mut impl Hvp, dim: usize, max_probes: usize, tol: f64, seed: u64) -> Vec<f64> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut vhv = Vec::new();
@@ -109,7 +111,7 @@ pub fn trace(hvp: &mut impl Hvp, dim: usize, max_probes: usize, tol: f64, seed: 
         let hv = hvp.apply(&v);
         vhv.push(dot(&hv, &v));
         let mean = vhv.iter().sum::<f64>() / vhv.len() as f64;
-        if (mean - running).abs() / (running + 1e-6) < tol {
+        if (mean - running).abs() / (running.abs() + 1e-6) < tol {
             return vhv;
         }
         running = mean;
