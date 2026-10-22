@@ -25,7 +25,8 @@ HEADER = """
 ADAMW_PTX = (
     HEADER
     + """
-// p, g, m, v: pointers; decay = 1 - lr * wd; omb1 = 1 - beta1; omb2 = 1 - beta2; bc2s = sqrt(1 - beta2^t);
+// p, g, m, v: pointers; decay = 1 - lr * wd; omb1 = 1 - beta1; omb2 = 1 - beta2; bc2s = 1 / sqrt(1 - beta2^t)
+// (a multiply by the reciprocal, as torch divides a tensor by a scalar);
 // step = lr / (1 - beta1^t); n = element count. Grid-stride loop, one element per iteration.
 .visible .entry adamw_f32(
     .param .u64 p_ptr, .param .u64 g_ptr, .param .u64 m_ptr, .param .u64 v_ptr,
@@ -82,7 +83,7 @@ LOOP_F32:
     mul.rn.f32 %f15, %f15, %f5;
     add.rn.f32 %f13, %f13, %f15;
     sqrt.rn.f32 %f16, %f13;
-    div.rn.f32 %f16, %f16, %f7;
+    mul.rn.f32 %f16, %f16, %f7;
     add.rn.f32 %f16, %f16, %f6;
     div.rn.f32 %f17, %f12, %f16;
     mul.rn.f32 %f17, %f17, %f8;
@@ -155,7 +156,7 @@ LOOP_BF16:
     mul.rn.f32 %f15, %f15, %f5;
     add.rn.f32 %f13, %f13, %f15;
     sqrt.rn.f32 %f16, %f13;
-    div.rn.f32 %f16, %f16, %f7;
+    mul.rn.f32 %f16, %f16, %f7;
     add.rn.f32 %f16, %f16, %f6;
     div.rn.f32 %f17, %f12, %f16;
     mul.rn.f32 %f17, %f17, %f8;
@@ -248,7 +249,7 @@ def adamw_scalars(lr, betas, eps, weight_decay, t):
         b2=_f32(b2),
         omb2=_f32(1 - b2),
         eps=_f32(eps),
-        bc2s=_f32((1 - b2**t) ** 0.5),
+        bc2s=float(np.float32(1) / np.float32((1 - b2**t) ** 0.5)),
         step=_f32(lr / (1 - b1**t)),
     )
 
@@ -270,7 +271,7 @@ def adamw_reference(p, g, m, v, lr, betas, eps, weight_decay, t):
     pw = pw * s["decay"]
     m.mul_(s["b1"]).add_(gw * s["omb1"])
     v.mul_(s["b2"]).add_((gw * gw) * s["omb2"])
-    denom = v.sqrt().div(s["bc2s"]).add(s["eps"])
+    denom = v.sqrt().mul(s["bc2s"]).add(s["eps"])
     pw = pw - (m / denom) * s["step"]
     p.copy_(pw.to(p.dtype))
 
