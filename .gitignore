@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+.ruff_cache/
+.pytest_cache/
+opal_runs/
+examples/track1/data/
+examples/track1/logs/
+*.pt
+.relay-opal-prompt.md
+noise.deleted-*
+rel.deleted-*
+venv.deleted-*
