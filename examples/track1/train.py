@@ -58,8 +58,10 @@ def program_ledger(run_dir):
     out = []
     for folder in sorted((Path(run_dir) / "programs").glob("v*")):
         files = {p.name: p.read_text(errors="replace") for p in folder.glob("*.py")}
-        language = "ptx" if any(".entry" in t and ".target" in t for t in files.values()) else "python"
-        if any("triton" in t for t in files.values()):
+        inline_ptx = any(".entry" in t and ".target" in t for t in files.values())
+        seed_ptx = any("relay_opal.ptx" in t or "PtxModule" in t for t in files.values())
+        language = "ptx" if inline_ptx else "python+seed-ptx" if seed_ptx else "python"
+        if any("import triton" in t for t in files.values()):
             language = "triton"
         out.append(
             dict(version=folder.name, files=sorted(files), language=language, bytes=sum(map(len, files.values())))

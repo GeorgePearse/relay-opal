@@ -88,7 +88,7 @@ commands, hardware, time and cost per arm are in `examples/README.md`.
 | backprop, same optimizer | 3.7079 | 0.058 | 35 s | 1 | none |
 | relay (OPAL `keep`) | 3.7036 | 1.54 | 954 s | 0.980 at init, 0.998 from update 50 | none |
 | relay + opal (Python programs) | 3.7051 | 1.70 between decisions, 2.75 with the waits | 1677 s | 0.999 / 0.998 | 12 decisions, 6 applied, USD 2.64 |
-| relay + opal + ptx | PTX_ROW |
+| relay + opal + ptx (agent may write PTX, unprotected) | 3.7050 | 1.53 between decisions, 3.07 with the waits | 1872 s | 0.999 / 0.998 | 13 decisions, 7 applied, USD 2.87 |
 
 The Relay PR reports 3.7044 for its logged seed-0 run and 3.7081 for backprop on 8xH100; one GPU reproduces both to
 the third decimal. The agent of the Python arm read the fidelity values, judged the estimator sound ("a fidelity
@@ -97,6 +97,22 @@ applied changes rewrote the analysis, took over the learning-rate schedule uncha
 rate of the 16 mixing scalars, and started the warmdown earlier. These are single-seed numbers; the Relay PR's own
 spread (3.7107 ± 0.0056 over five seeds for Relay, 3.7122 ± 0.0089 over three for backprop) is larger than the gaps
 between the arms.
+
+The path ledger of the PTX arm, the point of that experiment: the agent was told it could rewrite any of its three
+programs in Python, Triton or PTX, that nothing would check a kernel before it ran on the weights, and that the run
+report was how it would find out. Over 13 decisions it wrote 7 program versions, all Python edits of `updater.py`
+and `analysis.py` (per-group learning-rate multipliers for q, k, the mixing scalars and the value-embedding gate,
+then the warmdown's start and shape), kept the seed PTX AdamW kernel running under every version and never touched
+`estimator.py`, so the seed hidden-unit kernel ran unchanged too. Programs written in PTX or Triton: 0. Failed to
+assemble: 0. Ran and corrupted the weights: 0 (NaN and inf counts were 0 in all 61 consequence reports, the cosine
+never fell below 0.997 on the block matrices). Reverted by itself, restored from a checkpoint, or crashed: 0. Kept:
+all 7. Seconds per update of the estimator and of the update rule were the same at the end as before the agent's
+first decision (1.49 s and 0.036 s), because it changed neither. Verdict: given complete control and no protection,
+this agent took no path that could have corrupted anything; it reached the same loss as the Python arm by learning-
+rate edits alone. Whether it learns from a corruption is untested, because it caused none. It also said at its first
+decision that it could not see the Anvil optimizer's source or the warmdown's length (OPAL shows a `LambdaLR`
+function's source but not its closure values), which is a fact about what it was shown, to state in `task_facts`
+next time.
 
 ## Limits
 
