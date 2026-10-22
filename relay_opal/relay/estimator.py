@@ -23,6 +23,23 @@ from .kernels import EPS, hadamard, norm
 from .settings import RelaySettings
 from .spec import site_types
 
+KERNEL_NAMES = (
+    "code_estimate",
+    "coordinate_differences",
+    "cycle_derivatives",
+    "head_scores",
+    "heads_first",
+    "hidden_all",
+    "hidden_scores",
+    "key_scores",
+    "mlp_cycle",
+    "mlp_cycle_full",
+    "moved_heads",
+    "norm_cycle",
+    "readout_losses",
+    "value_scores",
+)
+
 
 class Capture:
     """The clean forward's cached activations, and the orthogonal draws."""
@@ -33,7 +50,7 @@ class Capture:
         self.dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         self.generator = torch.Generator(self.device).manual_seed(seed + 3)
         self.shared_generator = torch.Generator(self.device).manual_seed(seed + 5)
-        self.frames = {}
+        self.frames, self.kernels = {}, {}
         names = [spec.sites.wte, spec.sites.lm_head]
         for blk in spec.sites.blocks:
             names += [blk.c_q, blk.c_k, blk.c_v, blk.attn_proj, blk.c_fc, blk.mlp_proj]
@@ -97,7 +114,8 @@ class Capture:
 
     def head_error(self, sigma):
         raw = self.outputs[self.spec.sites.lm_head][..., : self.spec.vocab_size]
-        error = K.coordinate_differences(raw, self.y, sigma, self.spec.soft_cap)
+        fn = self.kernels.get("coordinate_differences", K.coordinate_differences)
+        error = fn(raw, self.y, sigma, self.spec.soft_cap)
         return F.pad(error, (0, self.outputs[self.spec.sites.lm_head].shape[-1] - raw.shape[-1]))
 
     def reassemble(self, site, error):
@@ -131,14 +149,26 @@ class RelayEstimator:
         self.times, self._last = {}, 0.0
         self.maps = {}
         self.named = dict(self.model.named_parameters())
+        self.kernels = {}
 
     def close(self):
         self.capture.close()
 
-    def configure(self, settings):
-        """Swap the knobs; validated before anything runs."""
+    def configure(self, settings, kernels=None):
+        """Swap the knobs (validated before anything runs) and, with kernels, the step functions: a dict naming
+        functions of relay_opal.relay.kernels (mlp_cycle, norm_cycle, hidden_all, key_scores, ...) mapped to
+        replacements with the same signature, Python, Triton or PTX. Nothing checks them."""
         self.s = settings.validate(self.spec.hidden)
+        if kernels is not None:
+            unknown = sorted(set(kernels) - set(KERNEL_NAMES))
+            if unknown:
+                raise ValueError(f"unknown kernel names {unknown}; known: {KERNEL_NAMES}")
+            self.kernels = dict(kernels)
+            self.capture.kernels = self.kernels
         return self
+
+    def k(self, name):
+        return self.kernels.get(name) or getattr(K, name)
 
     # ----- helpers -----------------------------------------------------------------------------------------
 
@@ -194,8 +224,8 @@ class RelayEstimator:
                         -1, self.width
                     )
                     yrep = ys.unsqueeze(1).expand(m, self.width).reshape(-1)
-                    losses = K.readout_losses(moved, weight, yrep, spec.soft_cap).view(m, self.width)
-                    clean = K.readout_losses(xs, weight, ys, spec.soft_cap).unsqueeze(1)
+                    losses = self.k("readout_losses")(moved, weight, yrep, spec.soft_cap).view(m, self.width)
+                    clean = self.k("readout_losses")(xs, weight, ys, spec.soft_cap).unsqueeze(1)
                     derivative = (losses - clean) / steps[t0 : t0 + per]
                     credit[t0 : t0 + per] += derivative @ H / self.width
                 continue
@@ -204,7 +234,7 @@ class RelayEstimator:
             per = max(1, s.probe_chunk // (self.width * vocab))
             for t0 in range(0, n, per):
                 xs, ys = x[t0 : t0 + per], y[t0 : t0 + per]
-                derivative = K.cycle_derivatives(
+                derivative = self.k("cycle_derivatives")(
                     xs @ weight.T,
                     C,
                     ys,
@@ -276,13 +306,13 @@ class RelayEstimator:
         estimate = torch.zeros(b, t, h, hd, device=self.device)
         for c in range(max(1, draws // chunk)):
             a = d.orthogonal_noise(site, draws, c, n, b, t, self.width).view(n, b, t, h, hd)
-            moved = K.moved_heads(raw, a, sigma, cos, sin)
+            moved = self.k("moved_heads")(raw, a, sigma, cos, sin)
             qa, ka = (moved, fixed) if kind == "q" else (fixed, moved)
             out = spec.attention(qa, ka, vals, blk.window).view(n, b, t, h, hd)
-            score = K.head_scores(out, baseline, target.view(b, t, h, hd))
+            score = self.k("head_scores")(out, baseline, target.view(b, t, h, hd))
             if kind == "k":
                 score = (Km.to(dt) @ score.to(dt)).float()
-            estimate += K.code_estimate(score, a)
+            estimate += self.k("code_estimate")(score, a)
         return (estimate / (draws * sigma)).reshape(b, t, self.width)
 
     def exact_key_errors(self, i, target):
@@ -323,7 +353,7 @@ class RelayEstimator:
                 j1 = min(j0 + s.key_chunk, hd)
                 for q0, k0 in pairs:
                     qs, ks = slice(q0, q0 + B), slice(k0, k0 + B)
-                    credit_all[r, :, ks, j0:j1] += K.key_scores(
+                    credit_all[r, :, ks, j0:j1] += self.k("key_scores")(
                         qp[:, qs],
                         kp[:, ks],
                         k_raw[:, ks],
@@ -381,10 +411,10 @@ class RelayEstimator:
                 eps = 0.1
                 slope = (torch.sigmoid(z + eps * a) - torch.sigmoid(z - eps * a)) / eps
                 move = slope.unsqueeze(-1) * ve
-            change = (A.to(bf) @ K.heads_first(move)).view(b, h, t, n, hd)
-            score = K.value_scores(change, hub)
+            change = (A.to(bf) @ self.k("heads_first")(move)).view(b, h, t, n, hd)
+            score = self.k("value_scores")(change, hub)
             credited = (Km.to(bf) @ score.to(bf)).float()
-            estimate += K.code_estimate(credited, a.view(n, b, t, h, w))
+            estimate += self.k("code_estimate")(credited, a.view(n, b, t, h, w))
         return {site: (estimate / draws).reshape(b, t, width)}
 
     def layer_internals(self, i, target, gradients):
@@ -427,7 +457,7 @@ class RelayEstimator:
         s = self.s
         if s.hidden == "all":
             steps = s.fc_sigma * u.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
-            return K.hidden_all(u, steps, g @ out_weight.float())
+            return self.k("hidden_all")(u, steps, g @ out_weight.float())
         k = s.hidden_topk
         Hk = hadamard(k, self.device, torch.float32) * self.signs(k)
         top = u.topk(k, dim=-1, sorted=False).indices
@@ -439,7 +469,7 @@ class RelayEstimator:
         for t0 in range(0, u.shape[0], per):
             ut, st, tt, gt = uk[t0 : t0 + per], steps[t0 : t0 + per], top[t0 : t0 + per], g[t0 : t0 + per]
             cols = F.embedding(tt, columns)
-            derivative = K.hidden_scores(ut, st, Hk, cols, gt)
+            derivative = self.k("hidden_scores")(ut, st, Hk, cols, gt)
             credit[t0 : t0 + per].scatter_(1, tt, derivative @ Hk / k)
         return credit
 
@@ -494,21 +524,21 @@ class RelayEstimator:
             d_out = g_top if i == L - 1 else lam_r[i + 1] * d_in[i + 1]
             if s.routes:
                 d_mid = self.cycle(
-                    K.mlp_cycle,
+                    self.k("mlp_cycle"),
                     mids[i],
                     [routes[i][0], routes[i][1], d_out],
                     [w_fc[i], w_out_t[i], measured_norm, bf16],
                 )
             else:
                 d_mid = self.cycle(
-                    K.mlp_cycle_full, mids[i], [routes[i][1], d_out], [w_fc[i], w_out_t[i], measured_norm, bf16]
+                    self.k("mlp_cycle_full"), mids[i], [routes[i][1], d_out], [w_fc[i], w_out_t[i], measured_norm, bf16]
                 )
             self.tick("mid")
             if not self.frozen("attn_proj"):
                 gradients[blk.attn_proj + ".weight"] = d_mid.T @ d.inputs[blk.attn_proj].flatten(0, 1)
             target = (d_mid @ self.named[blk.attn_proj + ".weight"].float()).view(b, t, W)
             u = self.layer_internals(i, target, gradients)
-            d_in[i] = d_mid + self.cycle(K.norm_cycle, xins[i], [u], [measured_norm])
+            d_in[i] = d_mid + self.cycle(self.k("norm_cycle"), xins[i], [u], [measured_norm])
             self.tick("input")
             if not self.frozen("mlp_proj"):
                 gradients[blk.mlp_proj + ".weight"] = d_out.T @ d.inputs[blk.mlp_proj].flatten(0, 1)
@@ -522,7 +552,7 @@ class RelayEstimator:
             scalars[:, i] = torch.stack([(d_in[i] * prev).sum(), (d_in[i] * x0).sum()])
         if not self.frozen("wte"):
             d_x0 = lam_r[0] * d_in[0] + sum(lam_0[i] * d_in[i] for i in range(L))
-            emb = self.cycle(K.norm_cycle, e, [d_x0], [measured_norm])
+            emb = self.cycle(self.k("norm_cycle"), e, [d_x0], [measured_norm])
             gradients[sites.wte + ".weight"] = d.reassemble(sites.wte, emb.view(b, t, W))
         self.tick("wte")
         if not self.frozen("lambdas"):

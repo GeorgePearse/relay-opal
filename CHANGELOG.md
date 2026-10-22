@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `relay_opal.ptx`: a ctypes loader for hand-written PTX through the CUDA driver API (`PtxModule`, assembly errors
+  carry the ptxas text, `launch` on torch tensors, `request_restore`); `relay_opal.ptx_seeds`: an AdamW step and
+  Relay's hidden-unit step in PTX, bit-identical to their eager twins (tested on an H100).
+- `RelayEstimator.configure(settings, kernels=...)`: any step of `relay_opal.relay.kernels` can be replaced by the
+  agent's function (Python, Triton or PTX); `estimator.py` may define `KERNELS`.
+- `relay_opal.wrap(..., mode="ptx", checkpoint_every=N)`: the agent writes PTX with no parity gate, sandbox or
+  fallback; every check reports NaN and inf counts, weight-norm drift and seconds per site type; checkpoints back a
+  `request_restore(update)` tool and the restart after a crash (crash text handed to the agent as a note).
+- `examples/track1`: the Noise Track 1 reproduction with four arms (backprop, relay, relay-opal, relay-opal-ptx), a
+  Modal launcher for one H100 with an ssh tunnel for the mailbox broker, and the one-seed results.
 - `relay_opal.wrap(optimizer, model, estimator, goal=..., total_steps=..., fidelity_every=..., **opal_kwargs)`: the
   hybrid. OPAL versions, swaps and reverts the modules its updater imports, so the agent gets a third program,
   `estimator.py`, whose `settings(update, total_updates)` the loop reads before every estimate; the fidelity report
