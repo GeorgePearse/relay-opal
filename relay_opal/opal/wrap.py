@@ -23,6 +23,7 @@ from ..fidelity import check
 from ..relay.settings import RelaySettings
 
 PROGRAM = Path(__file__).parent / "program"
+ANALYSIS = {"plain": "analysis.py", "signals": "analysis_signals.py"}
 PROMPT = Path(__file__).parent / "prompt.md"
 PROMPT_PTX = Path(__file__).parent / "prompt_ptx.md"
 
@@ -97,11 +98,33 @@ class RelayOpal:
     settings     the settings in force for the next estimate
     """
 
-    def __init__(self, opt, estimator, fidelity_every, trial_steps, log, every, checkpoint_every, checkpoint_dir):
+    def __init__(
+        self,
+        opt,
+        estimator,
+        fidelity_every,
+        trial_steps,
+        log,
+        every,
+        checkpoint_every,
+        checkpoint_dir,
+        signals_every=0,
+        optimizers=None,
+    ):
         self.opt, self.estimator = opt, estimator
         self.fidelity_every, self.trial_steps = fidelity_every, trial_steps
         self.every, self.checkpoint_every = every, checkpoint_every
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+        self.signals_every = signals_every
+        self.signals = []
+        self.instruments = None
+        self._scan_prev = None
+        self._signals_since = 0
+        if signals_every:
+            from ..signals import Instruments
+
+            names = Instruments.names_from(estimator.model, optimizers)
+            self.instruments = Instruments(optimizers, window=8, names=names)
         self.settings = self.fallback = estimator.s
         self.kernels = {}
         self.trial_until = 0
@@ -188,9 +211,15 @@ class RelayOpal:
             self.check_fidelity(x[: max(1, x.shape[0] // micro_batches)], y[: max(1, y.shape[0] // micro_batches)])
         if self.every and update % self.every == 0:
             self.report_consequences(update)
+        if self.instruments is not None:
+            self.instruments.before_step(loss)
         t1 = time.perf_counter()
         out = self.opt.step(loss=loss)
         self._update_seconds = time.perf_counter() - t1
+        if self.instruments is not None:
+            self.instruments.after_step()
+            if update % self.signals_every == 0:
+                self.report_signals(update)
         if self.checkpoint_every and update % self.checkpoint_every == 0:
             self.checkpoint(update)
         self._restore_if_requested(update)
@@ -247,6 +276,22 @@ class RelayOpal:
         self.opt.log({k: v for k, v in values.items() if v is not None}, show_agent=True)
         self.history.append(dict(update=update, consequences=values))
         return values
+
+    def report_signals(self, update):
+        """The per-layer signals since the previous report: per-group means of the Cockpit-style instruments, and
+        the WeightWatcher scan with the layers whose alpha moved most since the last scan. Numbers go to the agent
+        through opt.log(show_agent=True); the full rows are kept in self.signals."""
+        from ..signals import report
+
+        heads = getattr(self.estimator.spec, "n_head", None)
+        record, self._scan_prev = report(
+            self.estimator.model, self.instruments, self._scan_prev, self._signals_since, heads
+        )
+        self._signals_since = max(0, self.instruments.step - 1)  # the row for step t completes at step t + 1
+        self.opt.log(record["values"], show_agent=True)
+        record = dict(update=update, **record)
+        self.signals.append(record)
+        return record
 
     def checkpoint(self, update):
         """Parameters, the updater's state and the estimator's settings, kept in host memory (and on disk when a
@@ -327,13 +372,23 @@ def _to_cpu(obj):
     return obj
 
 
-def starting_program(settings, folder, mode="python"):
+def analysis_program(name="signals", heads=None):
+    """The text of a starting analysis program for opal.wrap: "plain" (loss, norms, estimator settings) or
+    "signals" (the same plus relay_opal.signals: alpha per layer and head, between-scan outliers, and the
+    instruments the training script logs). heads is the attention head count for the per-head split."""
+    text = (PROGRAM / ANALYSIS[name]).read_text()
+    if heads is not None:
+        text = text.replace("HEADS = None", f"HEADS = {int(heads)}", 1)
+    return text
+
+
+def starting_program(settings, folder, mode="python", analysis="plain", heads=None):
     """Write the three starting program files (updater.py, estimator.py, analysis.py) into `folder`."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     updater = "updater_ptx.py" if mode == "ptx" else "updater.py"
     (folder / "updater.py").write_text((PROGRAM / updater).read_text())
-    (folder / "analysis.py").write_text((PROGRAM / "analysis.py").read_text())
+    (folder / "analysis.py").write_text(analysis_program(analysis, heads))
     starting = json.dumps(settings.to_dict(), indent=4).replace("true", "True").replace("false", "False")
     template = ESTIMATOR_PTX_TEMPLATE if mode == "ptx" else ESTIMATOR_TEMPLATE
     (folder / "estimator.py").write_text(template.format(starting=starting))
@@ -355,6 +410,8 @@ def wrap(
     mode="python",
     checkpoint_every=0,
     checkpoint_dir=None,
+    signals=False,
+    analysis=None,
     log=print,
     **opal_kwargs,
 ):
@@ -366,16 +423,29 @@ def wrap(
     starting settings rather than to them. task_facts: extra facts for the agent's prompt. mode="ptx": the starting
     programs carry PTX kernels (relay_opal.ptx_seeds), the prompt tells the agent it has complete control and no
     protection, every check reports consequences, and checkpoints every checkpoint_every updates (in memory, and
-    under checkpoint_dir) back request_restore and the restart after a crash."""
+    under checkpoint_dir) back request_restore and the restart after a crash. signals=True runs the Cockpit-style
+    instruments of relay_opal.signals every update and, every `every` updates, logs their per-group means and the
+    WeightWatcher scan of the weights (alpha range, the layers whose alpha moved most) to the agent; analysis picks
+    the starting analysis program, "plain" or "signals" (the default when signals=True), which reports alpha per
+    layer and head at every decision."""
     s = estimator.s
-    program = starting_program(s, program_dir or tempfile.mkdtemp(prefix="relay-opal-program-"), mode)
+    every = opal_kwargs.get("every", 50)
+    heads = getattr(estimator.spec, "n_head", None)
+    analysis = analysis or ("signals" if signals else "plain")
+    program = starting_program(s, program_dir or tempfile.mkdtemp(prefix="relay-opal-program-"), mode, analysis, heads)
     facts = (
         f"The gradients are Relay's forward-only estimates, with routes={s.routes} of {estimator.spec.hidden} MLP "
         f"units, keys={s.keys!r}, values={s.values!r}, hidden={s.hidden!r} at the start (estimator.py)."
     )
-    every = opal_kwargs.get("every", 50)
     if fidelity_every:
         facts += f" The fidelity check runs at update 1 and every {fidelity_every} updates."
+    if signals:
+        facts += (
+            f" Every {every} updates the script logs signals_* values: per parameter group the means of the "
+            f"Cockpit-style instruments (grad_norm, update_ratio, grad_cosine, snr, alpha), and the WeightWatcher "
+            f"alpha range over layers with the largest change since the previous scan; the analysis program has "
+            f"the per-layer detail."
+        )
     if mode == "ptx":
         facts += (
             f" The consequence report runs every {every} updates; CHECKPOINT_EVERY = {checkpoint_every or 'never'}."
@@ -406,4 +476,6 @@ def wrap(
         every if mode == "ptx" else 0,
         checkpoint_every,
         checkpoint_dir,
+        signals_every=every if signals else 0,
+        optimizers=optimizer if isinstance(optimizer, (list, tuple)) else [optimizer],
     )

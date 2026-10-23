@@ -9,6 +9,12 @@ The model, init, optimizer, rates, warmdown schedule, batch (8 sequences per upd
 script's; the fixed step count (--steps) scales the schedule down for a short run. Writes config.json, metrics.jsonl,
 result.json and final.pt (loadable by qlabs-eng/noise utils/eval.py) to --output. --resume continues a run from
 --output/checkpoints/latest.pt (the PTX arm after a crash: crash.txt in --output is handed to the agent).
+
+--signals adds the per-layer signals of relay_opal.signals to every arm: the Cockpit-style instruments every update
+and, every --every updates, the WeightWatcher scan with the layers whose alpha moved most, written to signals.jsonl
+and (agent arms) logged to the agent, whose starting analysis program reports alpha per layer and head at every
+decision. The backprop arm adds the top Hessian eigenvalue and the edge of stability. The instruments copy the
+gradients to the host every update, so --signals changes the timing; the README's times are without it.
 """
 
 import argparse
@@ -24,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare_data import SEQ, TRAIN_ROWS, VAL_ROWS, load_rows  # noqa: E402
 
 import relay_opal  # noqa: E402
+from relay_opal import signals  # noqa: E402
 from relay_opal.models import GPTConfig, NoiseGPTSpec, make_model, make_optimizer  # noqa: E402
 
 SEED = 0
@@ -89,6 +96,7 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--preset", choices=("38m", "tiny"), default="38m", help="tiny: a 2-block width-64 smoke test.")
     parser.add_argument("--synthetic", type=int, default=0, help="Smoke test: this many random rows instead of data.")
+    parser.add_argument("--signals", action="store_true", help="Per-layer signals every --every updates (see above).")
     args = parser.parse_args()
     if args.arm in AGENT_ARMS and args.max_cost_usd is None:
         raise SystemExit("--max-cost-usd is required for the agent arms")
@@ -132,6 +140,7 @@ def main():
                     backend=args.backend if args.arm in AGENT_ARMS else "keep" if args.arm == "relay" else None,
                     max_cost_usd=args.max_cost_usd,
                     checkpoint_every=args.checkpoint_every,
+                    signals=args.signals,
                     torch=torch.__version__,
                     gpu=torch.cuda.get_device_name(0) if cuda else str(device),
                 ),
@@ -149,7 +158,7 @@ def main():
             return model, opts, scheds, None
         est = relay_opal.RelayEstimator(NoiseGPTSpec(model), settings, seed=fresh_seed)
         kw = (
-            dict(backend="keep")
+            dict(backend="keep", every=args.every)
             if args.arm == "relay"
             else dict(
                 backend=args.backend,
@@ -173,9 +182,33 @@ def main():
             mode="ptx" if ptx else "python",
             checkpoint_every=args.checkpoint_every,
             checkpoint_dir=checkpoints if args.checkpoint_every else None,
+            signals=args.signals,
             **kw,
         )
         return model, opts, scheds, loop
+
+    inline = dict(instruments=None, scan=None, since=0)  # the backprop arm's own signals (no loop to hold them)
+
+    def sharpness(model, x, y, lr):
+        """Top Hessian eigenvalue on one sequence of the batch in float32 (math attention, so the double backward
+        exists; the flash kernels on CPU and CUDA have none), and lambda_max * lr / 2 with the block matrices' rate."""
+        params = [p for p in model.parameters() if p.requires_grad]
+        ctx = torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH)
+        with ctx:
+            hess = signals.Hessian(lambda: model(x[:1], y[:1]), params)
+            top = hess.top_eigenvalues(k=1, max_iter=20, tol=1e-2)[0]
+        for p in params:
+            p.grad = None
+        return dict(sharpness=top, edge_of_stability=top * lr / 2, lr_matrices=lr, hvp_products=hess.products)
+
+    def inline_signals(model, opts, step, x, y):
+        record, inline["scan"] = signals.report(
+            model, inline["instruments"], inline["scan"], inline["since"], heads=config.n_head
+        )
+        inline["since"] = max(0, inline["instruments"].step - 1)  # rows complete one step late
+        record.update(sharpness(model, x, y, opts[0].param_groups[0]["lr"]))
+        record["values"].update({k: record[k] for k in ("sharpness", "edge_of_stability")})
+        return dict(update=step, **record)
 
     def update(model, opts, scheds, loop, x, y):
         if loop is None:
@@ -183,9 +216,13 @@ def main():
                 loss = model(x, y)
             loss.backward()
             loss = loss.detach()
+            if inline["instruments"] is not None:
+                inline["instruments"].before_step(loss)
             for o in opts:
                 o.step()
                 o.zero_grad(set_to_none=True)
+            if inline["instruments"] is not None:
+                inline["instruments"].after_step()
         else:
             loss = loop.step(x, y, micro_batches=args.batch // args.micro)
             loop.opt.zero_grad(set_to_none=True)
@@ -206,6 +243,8 @@ def main():
         if cuda:
             torch.cuda.empty_cache()
     model, opts, scheds, loop = build(args.seed)
+    if args.signals and loop is None:
+        inline["instruments"] = signals.Instruments(opts, names=signals.Instruments.names_from(model, opts))
 
     first, elapsed = 1, 0.0
     if args.resume:
@@ -231,16 +270,34 @@ def main():
         print(json.dumps(dict(resumed_at=first, train_seconds=elapsed)), flush=True)
 
     log = (args.output / "metrics.jsonl").open("a")
+    signals_log = (args.output / "signals.jsonl").open("a") if args.signals else None
     sync()
     start, paused = time.perf_counter() - elapsed, 0.0
     for step in range(first, steps + 1):
         batch = training[(step - 1) * args.batch : step * args.batch].to(device)
-        loss = update(model, opts, scheds, loop, batch[:, :-1].contiguous(), batch[:, 1:].contiguous())
+        x, y = batch[:, :-1].contiguous(), batch[:, 1:].contiguous()
+        loss = update(model, opts, scheds, loop, x, y)
         sync()
         elapsed = time.perf_counter() - start - paused
         record = dict(step=step, train_loss=round(float(loss), 6), train_seconds=round(elapsed, 2))
         if loop is not None and loop.fidelity and loop.fidelity[-1]["update"] == step:
             record["fidelity_block_matrices"] = loop.fidelity[-1]["cosine"]["block_matrices"]
+        if args.signals and step % args.every == 0:
+            pause = time.perf_counter()
+            signal = loop.signals[-1] if loop is not None and loop.signals else None
+            if loop is None:
+                signal = inline_signals(model, opts, step, x, y)
+            if signal is not None and signal["update"] == step:
+                record.update(
+                    {
+                        k: v
+                        for k, v in signal["values"].items()
+                        if "_alpha_" in k or k in ("sharpness", "edge_of_stability")
+                    }
+                )
+                signals_log.write(json.dumps(signal) + "\n")
+                signals_log.flush()
+            paused += time.perf_counter() - pause
         if args.eval_every and step % args.eval_every == 0 and step < steps:
             pause = time.perf_counter()
             record["val_loss"] = evaluate(model, val_rows)
