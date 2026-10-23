@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- `relay_opal.signals`: per-layer training signals as one Rust crate (`rust/signals`, pure Rust) behind a thin torch
+  glue. `scan(model)` is WeightWatcher's per-layer spectrum analysis (alpha, alpha_weighted, xmin, KS distance,
+  stable rank, log norms, entropy, rank loss; conv slices pooled, attention split per head), reproducing
+  WeightWatcher 0.7.7 on pretrained resnet18 within 1e-3 on every layer; `scan_delta` the between-scan deltas with
+  z-scored outliers; `TempBalance` the per-layer learning rates from alpha (the paper's linear map and the reference
+  code's sqrt, log2 and step rules, budget preserved); `Instruments` Cockpit's cheap per-step quantities (gradient
+  norm, update ratio, gradient cosine, step-wise SNR, local step size alpha) with the history kept in Rust;
+  `Hessian` PyHessian's power iteration, Hutchinson trace and stochastic Lanczos quadrature over an autograd HVP,
+  plus the edge of stability. Tests against WeightWatcher and PyHessian live in the `signals-test` extra.
+- `relay_opal.wrap(..., signals=True)` runs the instruments every update, scans the weights every `every` updates
+  and logs the per-group means and the alpha range with the largest change to the agent; `analysis="signals"` (the
+  default with signals) starts the agent from an analysis program that reports alpha per layer and head and the
+  between-scan outliers at every decision (`relay_opal.analysis_program`). The Track 1 example takes `--signals`
+  for every arm, writes `signals.jsonl`, and the backprop arm adds the top Hessian eigenvalue and the edge of
+  stability.
+- Build: the backend is maturin (the pure-Python package unchanged, the extension `relay_opal._signals` abi3 for
+  Python 3.10+); CI runs `cargo fmt`, `clippy -D warnings` and `cargo test`, and builds the extension on both Python
+  versions; `wheels.yml` builds manylinux x86_64 and aarch64 wheels and the sdist on tags.
 - `relay_opal.ptx`: a ctypes loader for hand-written PTX through the CUDA driver API (`PtxModule`, assembly errors
   carry the ptxas text, `launch` on torch tensors, `request_restore`); `relay_opal.ptx_seeds`: an AdamW step and
   Relay's hidden-unit step in PTX, bit-identical to their eager twins (tested on an H100).

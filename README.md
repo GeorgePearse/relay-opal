@@ -37,6 +37,12 @@ pip install git+https://github.com/GeorgePearse/relay-opal   # Python >= 3.10, t
 
 For the Track 1 example: `pip install "relay-opal[track1] @ git+https://github.com/GeorgePearse/relay-opal"`.
 
+The package carries a Rust extension (`relay_opal._signals`, the per-layer signals). Installing from source builds
+it with maturin, so a Rust toolchain must be on the path (`curl https://sh.rustup.rs -sSf | sh`); the build takes a
+minute and needs no system libraries. Tagged releases ship manylinux wheels for x86_64 and aarch64 that need no
+Rust. `pip install -e .` in a checkout installs the Python package editable and builds the extension in place;
+`maturin develop --release` rebuilds it after a change under `rust/`.
+
 ## Usage
 
 ```python
@@ -151,11 +157,46 @@ OPAL-rewritten). The per-layer signals tell the agent what the updates did: Weig
 differently, the Cockpit-style instruments for whether a layer's step is sized right, sharpness for the global
 learning-rate ceiling.
 
-## Roadmap
+## Per-layer signals
 
-Planned, not yet built: an analysis program for the agent with WeightWatcher's per-layer alpha, Cockpit-style
-per-layer instruments and PyHessian-style sharpness, so that per-layer learning rates (TempBalance as the starting
-rule) and the estimator's knobs can follow measured signals rather than the loss alone.
+`relay_opal.signals` gives the agent, and any trainer, the per-layer signals of the Inspiration table as one Rust
+implementation (`rust/signals`, pure Rust, `faer` for the linear algebra) behind a thin torch glue. Rust does every
+numeric that needs no autograd and never sees a tensor: flat float arrays in, numbers out. torch collects weights,
+gradients, parameters and losses, and supplies the Hessian-vector product.
+
+```python
+from relay_opal import signals
+
+frame = signals.scan(model)                        # polars: one row per weight matrix and per attention head
+delta = signals.scan_delta(previous, frame)        # what moved since the last scan, z-scored across layers
+tb = signals.TempBalance(opt, model, base_lr=3e-4) # opt built from TempBalance.groups_from(model, base_lr)
+tb.step(frame)                                     # per-group lr from alpha: lower for hot layers, higher for cold
+ins = signals.Instruments(opt, window=8)           # before_step(loss) after backward, after_step() after opt.step()
+ins.table()                                        # grad_norm, update_ratio, grad_cosine, snr, alpha per group, step
+hess = signals.Hessian(lambda: loss_fn(model, x, y), params)
+hess.top_eigenvalues(k=1), hess.trace(), hess.density(), hess.edge_of_stability(lr)   # backprop models only
+```
+
+| Signal | Reference | What the Rust does | Parity |
+| --- | --- | --- | --- |
+| `scan`: alpha, alpha_weighted, xmin, KS distance, stable rank, log norms, entropy, rank loss per matrix | WeightWatcher 0.7.7, `analyze()` defaults | Its own `WWFit`: CSN continuous MLE, xmin by the smallest KS distance over every eigenvalue but the largest, the small-N path under 20 eigenvalues, eigenvalues under 1e-5 dropped, conv slices pooled per layer and scaled by `sqrt(1/2)` (`conv2d_norm`) | `tests/test_signals_weightwatcher.py`: 20 Pareto-tailed matrices and pretrained resnet18, every layer within 1e-3 with the same xmin |
+| `TempBalance`: per-group learning rates from alpha | Zhou et al. 2023, equation (2), and the reference code's `sqrt`, `log2`, `step` | The map, excluded layers at the base rate, the mean over balanced layers kept at the base rate (`rescale=False` is the reference code's unscaled map) | `tests/test_signals_tempbalance.py` |
+| `Instruments`: gradient norm, update ratio, gradient cosine, step-wise SNR, local step size alpha | Cockpit, the quantities that need no per-sample gradients | A `Window` keeps the last k gradients and the pending update per group in Rust; alpha is Cockpit's quadratic fit through two losses and two directional derivatives (-1 stayed put, 0 on the fitted minimum, +1 overshot) | `tests/test_signals_instruments.py`, closed forms on a 1-D quadratic |
+| `Hessian`: top eigenvalues, trace, spectral density, edge of stability | PyHessian | Power iteration with deflation, Hutchinson, stochastic Lanczos quadrature, step for step, over an HVP callback (autograd stays in Python); plus a Lanczos top-k | `tests/test_signals_hessian.py`: eigenvalues exact against the dense Hessian of a tiny MLP, top eigenvalue within 0.1% of PyHessian, traces within Hutchinson's standard error |
+
+Conventions worth knowing: attention projections (`c_q`, `c_k`, `c_v`, `q_proj`, `in_proj`, ...) are split one
+matrix per head and reported per head and pooled per layer; 1x1 convolutions and output heads are excluded by
+default; Relay arms get the scan and the instruments but no sharpness, since Relay never builds a graph; the
+instruments copy each group's gradients and parameters to the host once per step, so on the 37.7M Track 1 GPT they
+cost about 0.1 s per update and a window of 8 holds 1.2 GB of host memory. The paper defines no sigmoid rule for
+TempBalance and the reference code has none, so none is offered.
+
+For the agent, `relay_opal.wrap(..., signals=True)` runs the instruments every update, scans the weights every
+`every` updates and logs the per-group means and the alpha range with the largest change to `opt.log(...,
+show_agent=True)`, and starts the agent from an analysis program (`relay_opal.analysis_program("signals")`) that
+reports alpha per layer, the per-head spread and the between-scan outliers at every decision. The Track 1 example
+takes `--signals` for every arm and writes `signals.jsonl`; the backprop arm adds the top Hessian eigenvalue and the
+edge of stability.
 
 ## Credits
 
