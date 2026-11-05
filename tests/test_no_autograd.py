@@ -42,7 +42,6 @@ def test_estimate_does_not_build_a_graph_even_with_grad_enabled(tiny):
     assert all(g.grad_fn is None for g in grads.values())
 
 
-def test_tripwire_itself_fires():
+def test_tripwire_itself_fires(tripwire):
     with pytest.raises(AutogradUsed):
-        pytest.MonkeyPatch().setattr(torch.Tensor, "backward", lambda *a, **k: (_ for _ in ()).throw(AutogradUsed()))
         torch.ones(1, requires_grad=True).sum().backward()

@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling==1.27.0"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
 
 [project]
 name = "relay-opal"
@@ -27,11 +27,16 @@ Homepage = "https://github.com/GeorgePearse/relay-opal"
 Changelog = "https://github.com/GeorgePearse/relay-opal/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-dev = ["pytest==8.4.2", "ruff==0.14.1"]
+dev = ["pytest==8.4.2", "ruff==0.14.1", "polars==1.36.1"]
+signals-test = ["weightwatcher==0.7.7", "pyhessian==0.1", "torchvision==0.24.1"]
 track1 = ["tokenizers==0.23.1", "datasets==4.8.4", "polars==1.36.1", "modal==1.3.3"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["relay_opal"]
+[tool.maturin]
+manifest-path = "rust/signals-py/Cargo.toml"
+python-source = "."
+module-name = "relay_opal._signals"
+python-packages = ["relay_opal"]
+include = [{ path = "rust/**", format = "sdist" }, { path = "Cargo.toml", format = "sdist" }, { path = "Cargo.lock", format = "sdist" }, { path = "rustfmt.toml", format = "sdist" }]
 
 [tool.ruff]
 line-length = 120
